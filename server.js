@@ -1,82 +1,168 @@
-const express   = require('express');
-const crypto    = require('crypto');
-const { generateInvoicePDF }      = require('./generateInvoice');
-const { uploadPDFToCloudinary }   = require('./uploadToCloudinary');
-const { sendInvoiceOnWhatsApp }   = require('./sendWhatsApp');
 require('dotenv').config();
+const express = require('express');
+const crypto = require('crypto');
+const { generateInvoicePDF } = require('./generateInvoice');
+const { uploadPDFToCloudinary } = require('./uploadToCloudinary');
+const { sendInvoiceOnWhatsApp } = require('./sendWhatsApp');
+const { createPaymentLink } = require('./createPaymentLink');
 
 const app = express();
+
+// ═══════════════════════════════════════════════════
+//  JSON middleware AFTER webhook (important order!)
+// ═══════════════════════════════════════════════════
 app.use(express.json());
 
-// ── Health Check ──────────────────────────────
+// ═══════════════════════════════════════════════════
+//  HEALTH CHECK
+// ═══════════════════════════════════════════════════
 app.get('/', (req, res) => {
-  res.send('✅ Invoice WhatsApp Server is running!');
+  res.send('✅ Kitchen Fresh Invoice Server is running!');
 });
 
-// ── Razorpay Webhook ──────────────────────────
-app.post('/razorpay-webhook', async (req, res) => {
+// ═══════════════════════════════════════════════════
+//  HALOSENDER INCOMING MESSAGE WEBHOOK
+// ═══════════════════════════════════════════════════
+app.post('/halosender-webhook', (req, res) => {
+  const body = req.body;
 
-  // 1. Verify Razorpay signature
-  const shasum = crypto.createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET);
-  shasum.update(JSON.stringify(req.body));
-  const digest = shasum.digest('hex');
+  if (body.object === 'whatsapp_business_account') {
+    const changes = body.entry?.[0]?.changes?.[0]?.value;
+    const contacts = changes?.contacts?.[0];
+    const message = changes?.messages?.[0];
 
-  if (digest !== req.headers['x-razorpay-signature']) {
-    console.error('❌ Invalid webhook signature');
-    return res.status(400).json({ error: 'Invalid signature' });
+    if (message) {
+      const customerPhone = contacts?.wa_id || message.from;
+      const customerName = contacts?.profile?.name || 'Customer';
+      const messageText = message.text?.body || '';
+      const phoneNumberId = changes?.metadata?.phone_number_id;
+
+      console.log(`\n📩 Incoming WhatsApp Message`);
+      console.log(`📱 From       : ${customerPhone}`);
+      console.log(`👤 Name       : ${customerName}`);
+      console.log(`💬 Message    : ${messageText}`);
+      console.log(`📞 Phone ID   : ${phoneNumberId}`);
+    }
   }
 
-  // 2. Only handle payment.captured
-  if (req.body.event !== 'payment.captured') {
-    return res.status(200).send('Event ignored');
+  res.status(200).send('OK');
+});
+
+// ═══════════════════════════════════════════════════
+//  CREATE PAYMENT LINK
+// ═══════════════════════════════════════════════════
+app.post('/create-payment-link', async (req, res) => {
+  const { name, phone, email, amount, description, items } = req.body;
+
+  if (!name || !phone || !amount) {
+    return res.status(400).json({
+      success: false,
+      error: 'name, phone and amount are required'
+    });
   }
-
-  const payment = req.body.payload.payment.entity;
-
-  // 3. Extract customer details
-  const orderData = {
-    orderId:      payment.order_id  || payment.id,
-    paymentId:    payment.id,
-    customerName: payment.notes?.name  || 'Valued Customer',
-    phone:        payment.contact.replace('+', ''),  // "919876543210"
-    email:        payment.email        || 'N/A',
-    amount:       payment.amount,                    // in paise
-    description:  payment.description || 'Professional Services'
-  };
-
-  console.log(`\n🔔 Payment captured: ${orderData.orderId}`);
-  console.log(`👤 Customer: ${orderData.customerName} | ${orderData.phone}`);
 
   try {
-    // Step A: Generate PDF
-    console.log('📄 Generating PDF invoice...');
-    const pdfPath = await generateInvoicePDF(orderData);
-    console.log(`✅ PDF ready: ${pdfPath}`);
+    const paymentUrl = await createPaymentLink({
+      name, phone, email, amount, description, items
+    });
 
-    // Step B: Upload to Cloudinary
-    console.log('☁️  Uploading to Cloudinary...');
-    const pdfUrl = await uploadPDFToCloudinary(pdfPath, orderData.orderId);
-    console.log(`✅ Cloudinary URL ready`);
+    console.log(`🔗 Payment link created for ${name} (${phone})`);
 
-    // Step C: Send on WhatsApp
-    console.log('📲 Sending WhatsApp invoice...');
-    await sendInvoiceOnWhatsApp(
-      orderData.phone,
-      pdfUrl,
-      orderData.customerName,
-      orderData.orderId
-    );
-    console.log(`✅ Invoice sent to ${orderData.phone} successfully!\n`);
+    res.json({
+      success:     true,
+      payment_url: paymentUrl
+    });
 
   } catch (err) {
-    console.error('❌ Invoice flow failed:', err.message);
+    console.error('❌ Payment link error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
-
-  res.status(200).json({ status: 'ok' });
 });
 
-// ── Start Server ──────────────────────────────
+// ═══════════════════════════════════════════════════
+//  RAZORPAY WEBHOOK - FIXED
+// ═══════════════════════════════════════════════════
+app.post('/razorpay-webhook', express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    // 1. Signature verification (raw body)
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    const receivedSignature = req.headers['x-razorpay-signature'];
+
+    const expectedSignature = crypto
+      .createHmac('sha256', webhookSecret)
+      .update(req.body)
+      .digest('hex');
+
+    if (receivedSignature !== expectedSignature) {
+      console.error('❌ Invalid webhook signature');
+      return res.status(400).json({ error: 'Invalid signature' });
+    }
+
+    // 2. Parse payload
+    const payload = JSON.parse(req.body.toString());
+
+    if (payload.event !== 'payment.captured') {
+      return res.status(200).send('Event ignored');
+    }
+
+    const payment = payload.payload.payment.entity;
+
+    // 3. Parse items
+    let items = [];
+    try {
+      items = JSON.parse(payment.notes?.items || '[]');
+    } catch {
+      items = [{
+        name:      payment.description || 'Product',
+        qty:       1,
+        unitPrice: payment.amount / 100,
+        total:     payment.amount / 100
+      }];
+    }
+
+    // 4. Order data
+    const rawPhone = payment.notes?.phone || payment.contact || '';
+    const orderData = {
+      orderId:     payment.order_id || payment.id,
+      paymentId:   payment.id,
+      customerName: payment.notes?.name || 'Valued Customer',
+      phone:       rawPhone.replace(/[^0-9]/g, ''),
+      email:       payment.email || 'N/A',
+      amount:      payment.amount,
+      description: payment.description || 'Kitchen Fresh Order',
+      items:       items
+    };
+
+    console.log(`\n🔔 Payment Captured! ${orderData.customerName} (${orderData.phone}) Rs.${orderData.amount/100}`);
+
+    // 5. Respond immediately
+    res.status(200).json({ status: 'received' });
+
+    // 6. Process invoice async
+    processInvoice(orderData);
+
+  } catch (err) {
+    console.error('❌ Webhook error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+async function processInvoice(orderData) {
+  try {
+    const pdfPath = await generateInvoicePDF(orderData);
+    const pdfUrl = await uploadPDFToCloudinary(pdfPath, orderData.orderId);
+    await sendInvoiceOnWhatsApp(orderData.phone, pdfUrl, orderData.customerName, orderData.orderId);
+    console.log(`✅ Invoice completed: ${orderData.orderId}`);
+  } catch (err) {
+    console.error(`❌ Invoice failed [${orderData.orderId}]:`, err.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════
+//  START SERVER
+// ═══════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`\n🚀 Server running on port ${PORT}`);
+  console.log(`📬 Webhook URL: https://pannal.invoice.com/razorpay-webhook`);
 });

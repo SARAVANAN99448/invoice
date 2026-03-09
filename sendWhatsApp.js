@@ -1,16 +1,15 @@
 const axios = require('axios');
-require('dotenv').config();
 
 async function sendInvoiceOnWhatsApp(phone, pdfUrl, customerName, orderId) {
   const url = `https://graph.facebook.com/v21.0/${process.env.HALOSENDER_PHONE_NUMBER_ID}/messages`;
 
   const payload = {
     messaging_product: "whatsapp",
-    recipient_type: "individual",
-    to: phone,                     // e.g. "919876543210"
-    type: "template",
+    recipient_type:    "individual",
+    to:                phone,
+    type:              "template",
     template: {
-      name: "invoice_after_payment",
+      name:     "invoice_after_payment",
       language: { code: "en" },
       components: [
         {
@@ -19,7 +18,7 @@ async function sendInvoiceOnWhatsApp(phone, pdfUrl, customerName, orderId) {
             {
               type: "document",
               document: {
-                link: pdfUrl,
+                link:     pdfUrl,
                 filename: `Invoice_${orderId}.pdf`
               }
             }
@@ -39,7 +38,7 @@ async function sendInvoiceOnWhatsApp(phone, pdfUrl, customerName, orderId) {
   const response = await axios.post(url, payload, {
     headers: {
       'Authorization': `Bearer ${process.env.HALOSENDER_API_KEY}`,
-      'Content-Type': 'application/json'
+      'Content-Type':  'application/json'
     }
   });
 
